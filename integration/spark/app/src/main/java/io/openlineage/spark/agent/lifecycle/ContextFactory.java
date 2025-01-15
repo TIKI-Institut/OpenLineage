@@ -35,6 +35,16 @@ public class ContextFactory {
   @Getter private final SparkOpenLineageConfig config;
   private final OpenLineageEventHandlerFactory handlerFactory;
 
+  /**
+   * Spark can run multiple SQL queries in the context of streaming query being processed. In this
+   * case we want to all the events to share the run id, job name and make sure that START and
+   * COMPLETE events are sent only once.
+   */
+  private boolean streamingQueryMode = false;
+
+  /** OpenLineage context to be reused when running within streaming queries. */
+  @Getter private Optional<OpenLineageContext> streamingContext = Optional.empty();
+
   public ContextFactory(
       EventEmitter openLineageEventEmitter,
       MeterRegistry meterRegistry,
@@ -93,9 +103,24 @@ public class ContextFactory {
       log.error("Query execution is null: can't emit event for executionId {}", executionId);
       return Optional.empty();
     }
+
     SparkSession sparkSession = Spark4CompatUtils.getSparkSession(queryExecution);
+
+    OpenLineageContext.OpenLineageContextBuilder builder = OpenLineageContext.builder();
+    boolean markStartEmitted = false;
+
+    if (streamingQueryMode && streamingContext.isPresent()) {
+      // pass some values from the existent streaming context
+      builder
+              .runUuid(streamingContext.get().getRunUuid())
+              .applicationUuid(streamingContext.get().getApplicationUuid())
+              .jobName(streamingContext.get().getJobName());
+
+      markStartEmitted = true;
+    }
+
     OpenLineageContext olContext =
-        OpenLineageContext.builder()
+        builder
             .sparkSession(sparkSession)
             .sparkContext(sparkSession.sparkContext())
             .openLineage(new OpenLineage(Versions.OPEN_LINEAGE_PRODUCER_URI))
@@ -109,11 +134,23 @@ public class ContextFactory {
             .openLineageConfig(config)
             .sparkExtensionVisitorWrapper(new SparkOpenLineageExtensionVisitorWrapper(config))
             .build();
+
     OpenLineageRunEventBuilder runEventBuilder =
         new OpenLineageRunEventBuilder(olContext, handlerFactory);
-    return Optional.of(
+    SparkSQLExecutionContext sqlExecutionContext =
         new SparkSQLExecutionContext(
-            executionId, openLineageEventEmitter, olContext, runEventBuilder));
+            executionId, openLineageEventEmitter, olContext, runEventBuilder, streamingQueryMode);
+
+    if (streamingQueryMode && !streamingContext.isPresent()) {
+      streamingContext = Optional.of(olContext);
+    }
+
+    // as streaming context exists, START event was already emitted
+    if (markStartEmitted) {
+      sqlExecutionContext.setStartEmitted();
+    }
+
+    return Optional.of(sqlExecutionContext);
   }
 
   public Optional<ExecutionContext> createSparkSQLExecutionContext(
@@ -141,8 +178,22 @@ public class ContextFactory {
               OpenLineageRunEventBuilder runEventBuilder =
                   new OpenLineageRunEventBuilder(olContext, handlerFactory);
               return new SparkSQLExecutionContext(
-                  event.executionId(), openLineageEventEmitter, olContext, runEventBuilder);
+                  event.executionId(),
+                  openLineageEventEmitter,
+                  olContext,
+                  runEventBuilder,
+                  streamingQueryMode);
             });
+  }
+
+  public void clearStreamingQueryMode() {
+    streamingContext = Optional.empty();
+    streamingQueryMode = false;
+  }
+
+  public void startStreamingQueryMode() {
+    streamingQueryMode = true;
+    streamingContext = Optional.empty();
   }
 
   public void close() {
