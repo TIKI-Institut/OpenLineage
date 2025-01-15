@@ -54,7 +54,9 @@ class SparkSQLExecutionContext implements ExecutionContext {
   private final OpenLineageContext olContext;
   private final EventEmitter eventEmitter;
   private final OpenLineageRunEventBuilder runEventBuilder;
+  private final boolean isInStreamingQueryMode;
 
+  private boolean shouldEmitStartEvent = true;
   private boolean emittedOnSqlExecutionStart = false;
   private boolean emittedOnSqlExecutionEnd = false;
   private boolean emittedOnJobStart = false;
@@ -68,11 +70,13 @@ class SparkSQLExecutionContext implements ExecutionContext {
       long executionId,
       EventEmitter eventEmitter,
       OpenLineageContext olContext,
-      OpenLineageRunEventBuilder runEventBuilder) {
+      OpenLineageRunEventBuilder runEventBuilder,
+      boolean isInStreamingQueryMode) {
     this.executionId = executionId;
     this.eventEmitter = eventEmitter;
     this.olContext = olContext;
     this.runEventBuilder = runEventBuilder;
+    this.isInStreamingQueryMode = isInStreamingQueryMode;
   }
 
   @Override
@@ -91,7 +95,7 @@ class SparkSQLExecutionContext implements ExecutionContext {
 
     olContext.setActiveJobId(activeJobId);
     // only one START event is expected, in case it was already sent with jobStart, we send running
-    EventType eventType = emittedOnJobStart ? RUNNING : START;
+    EventType eventType = !shouldEmitStartEvent || emittedOnJobStart ? RUNNING : START;
     emittedOnSqlExecutionStart = true;
 
     RunEvent event =
@@ -139,6 +143,9 @@ class SparkSQLExecutionContext implements ExecutionContext {
     EventType eventType;
     if (emittedOnJobStart && !emittedOnJobEnd) {
       // expecting jobEnd event later on
+      eventType = RUNNING;
+    } else if (isInStreamingQueryMode) {
+      // streaming query mode should never emit COMPLETE event for SQL
       eventType = RUNNING;
     } else {
       eventType = COMPLETE;
@@ -274,7 +281,7 @@ class SparkSQLExecutionContext implements ExecutionContext {
 
     // only one START event is expected, in case it was already sent with sqlExecutionStart, we send
     // running
-    EventType eventType = emittedOnSqlExecutionStart ? RUNNING : START;
+    EventType eventType = !shouldEmitStartEvent || emittedOnSqlExecutionStart ? RUNNING : START;
     emittedOnJobStart = true;
 
     RunEvent event =
@@ -324,6 +331,9 @@ class SparkSQLExecutionContext implements ExecutionContext {
       eventType = FAIL;
     } else if (emittedOnSqlExecutionStart && !emittedOnSqlExecutionEnd) {
       // still waiting for sqlExecutionEnd event which will emit COMPLETE event
+      eventType = RUNNING;
+    } else if (isInStreamingQueryMode) {
+      // streaming query mode should never emit COMPLETE event for SQL
       eventType = RUNNING;
     } else {
       eventType = COMPLETE;
@@ -377,6 +387,10 @@ class SparkSQLExecutionContext implements ExecutionContext {
         eventEmitter
             .getRootParentJobNamespace()
             .orElse(eventEmitter.getParentJobNamespace().orElse(eventEmitter.getJobNamespace())));
+  }
+
+  public void setStartEmitted() {
+    this.shouldEmitStartEvent = false;
   }
 
   protected OpenLineage.JobBuilder buildJob() {
