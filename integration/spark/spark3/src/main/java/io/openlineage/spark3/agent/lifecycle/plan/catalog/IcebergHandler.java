@@ -37,7 +37,6 @@ import org.apache.iceberg.spark.SparkSessionCatalog;
 import org.apache.iceberg.spark.source.SparkTable;
 import org.apache.spark.SparkContext;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 
@@ -50,6 +49,7 @@ public class IcebergHandler implements CatalogHandler {
 
   private static final String TYPE = "type";
   private static final String CATALOG_IMPL = "catalog-impl";
+  private static final String BIG_QUERY_METASTORE_CATALOG = "bigquerymetastore";
 
   public IcebergHandler(OpenLineageContext context) {
     this.context = context;
@@ -69,6 +69,45 @@ public class IcebergHandler implements CatalogHandler {
   @Override
   public boolean isClass(TableCatalog tableCatalog) {
     return (tableCatalog instanceof SparkCatalog) || (tableCatalog instanceof SparkSessionCatalog);
+  }
+
+  @Override
+  public Optional<CatalogWithAdditionalFacets> getCatalogDatasetFacet(
+      TableCatalog tableCatalog, Map<String, String> properties) {
+    Optional<Map<String, String>> catalogConf =
+        context
+            .getSparkSession()
+            .map(SparkSession::conf)
+            .map(conf -> conf.getAll())
+            .map(ScalaConversionUtils::fromMap)
+            .map(map -> getCatalogProperties(map, tableCatalog.name()));
+
+    if (!catalogConf.isPresent()) {
+      return Optional.empty();
+    }
+    Map<String, String> conf = catalogConf.get();
+    String catalogType = getCatalogType(conf);
+
+    OpenLineage.CatalogDatasetFacetBuilder builder =
+        context
+            .getOpenLineage()
+            .newCatalogDatasetFacetBuilder()
+            .name(tableCatalog.name())
+            .framework("iceberg")
+            .type(catalogType)
+            .source("spark");
+
+    String warehouseLocation = conf.get(CatalogProperties.WAREHOUSE_LOCATION);
+    if (warehouseLocation != null && !warehouseLocation.trim().isEmpty()) {
+      builder.warehouseUri(warehouseLocation);
+    }
+
+    String catalogUri = conf.get(CatalogProperties.URI);
+    if (catalogUri != null && !catalogUri.trim().isEmpty()) {
+      builder.metadataUri(catalogUri);
+    }
+
+    return Optional.of(CatalogWithAdditionalFacets.of(builder.build()));
   }
 
   @Override
@@ -124,9 +163,16 @@ public class IcebergHandler implements CatalogHandler {
       maybeSymlink = getSymlinkIdentifier(session, catalogType, catalogConf, tableName);
     }
 
+    if (!maybeTableLocation.isPresent() && warehouseLocation == null) {
+      log.debug(
+          "The catalog type is 'rest' and the table location and warehouse location is empty. This is likely a table that is being created");
+      throw new MissingDatasetIdentifierCatalogException(
+          "No table location found. Probably needs to create table first");
+    }
+
     Path tableLocation =
         maybeTableLocation.orElseGet(
-            () -> reconstructDefaultLocation(new Path(warehouseLocation), identifier));
+            () -> reconstructDefaultLocation(new Path(warehouseLocation), identifier, catalogType));
     DatasetIdentifier di = PathUtils.fromPath(tableLocation);
     maybeSymlink.ifPresent(
         symlink -> di.withSymlink(symlink.getName(), symlink.getNamespace(), SymlinkType.TABLE));
@@ -163,6 +209,7 @@ public class IcebergHandler implements CatalogHandler {
           FilesystemDatasetUtils.fromLocationAndName(
               new Path(warehouseLocation).toUri(), tableName);
     }
+    log.debug("Received symlink {}", value);
     return Optional.ofNullable(value);
   }
 
@@ -205,7 +252,7 @@ public class IcebergHandler implements CatalogHandler {
     if (confUri == null) {
       metastoreUri =
           SparkConfUtils.getMetastoreUri(session.sparkContext())
-              .orElseThrow(() -> new UnsupportedCatalogException("hive"));
+              .orElseThrow(() -> new MissingDatasetIdentifierCatalogException("hive"));
     } else {
       metastoreUri = new URI(confUri);
     }
@@ -222,9 +269,10 @@ public class IcebergHandler implements CatalogHandler {
   @SneakyThrows
   private DatasetIdentifier getGlueIdentifier(String table, SparkSession sparkSession) {
     SparkContext sparkContext = sparkSession.sparkContext();
-    String arn =
-        AwsUtils.getGlueArn(sparkContext.getConf(), sparkContext.hadoopConfiguration()).get();
-    return new DatasetIdentifier(GLUE_TABLE_PREFIX + table.replace(".", "/"), arn);
+    Optional<String> arn =
+        AwsUtils.getGlueArn(sparkContext.getConf(), sparkContext.hadoopConfiguration());
+    return arn.map(s -> new DatasetIdentifier(GLUE_TABLE_PREFIX + table.replace(".", "/"), s))
+        .orElse(null);
   }
 
   @SneakyThrows
@@ -262,19 +310,28 @@ public class IcebergHandler implements CatalogHandler {
         SparkSessionCatalog sparkCatalog = (SparkSessionCatalog) tableCatalog;
         return Optional.ofNullable(sparkCatalog.icebergCatalog().loadTable(tableIdentifier));
       }
-    } catch (NoSuchTableException e) {
-      // don't log stack trace for missing tables
-      log.warn("Failed to load table from catalog: {}", identifier);
-      return Optional.empty();
     } catch (ClassCastException e) {
       log.error("Failed to load table from catalog: {}", identifier, e);
       return Optional.empty();
+    } catch (Exception e) {
+      if (e instanceof org.apache.spark.sql.catalyst.analysis.NoSuchTableException
+          || e instanceof org.apache.iceberg.exceptions.NoSuchTableException) {
+        // probably trying to obtain table details on START event while table does not exist
+        return Optional.empty();
+      }
+      throw e;
     }
   }
 
-  private Path reconstructDefaultLocation(Path warehouseLocation, Identifier identifier) {
+  private Path reconstructDefaultLocation(
+      Path warehouseLocation, Identifier identifier, String catalogType) {
     // namespace1.namespace2.table -> /warehouseLocation/namespace1/namespace2/table
     String[] namespace = identifier.namespace();
+    if (namespace.length > 0
+        && BIG_QUERY_METASTORE_CATALOG.equals(catalogType)
+        && !namespace[namespace.length - 1].endsWith(".db")) {
+      namespace[namespace.length - 1] = namespace[namespace.length - 1] + ".db";
+    }
     ArrayList<String> pathComponents = new ArrayList<>(namespace.length + 1);
     pathComponents.addAll(Arrays.asList(namespace));
     pathComponents.add(identifier.name());
@@ -299,8 +356,21 @@ public class IcebergHandler implements CatalogHandler {
           "Default the catalog type to 'glue' because the catalog impl is {}",
           catalogConf.get(CATALOG_IMPL));
       return "glue";
+    } else if (catalogConf.containsKey(CATALOG_IMPL)
+        && catalogConf.get(CATALOG_IMPL).endsWith("RESTCatalog")) {
+      log.debug(
+          "Default the catalog type to 'rest' because the catalog impl is {}",
+          catalogConf.get(CATALOG_IMPL));
+      return "rest";
+    } else if (catalogConf.containsKey(CATALOG_IMPL)
+        && catalogConf.get(CATALOG_IMPL).endsWith("BigQueryMetastoreCatalog")) {
+      log.debug(
+          "Default the catalog type to 'bigquerymetastore' because the catalog impl is {}",
+          catalogConf.get(CATALOG_IMPL));
+      return BIG_QUERY_METASTORE_CATALOG;
     } else {
-      return null;
+      // https://github.com/apache/iceberg/blob/apache-iceberg-1.9.1/core/src/main/java/org/apache/iceberg/CatalogUtil.java#L298
+      return "hive";
     }
   }
 }

@@ -26,20 +26,21 @@ idea {
 }
 
 ext {
-    assertjVersion = "3.27.2"
+    assertjVersion = "3.27.3"
     deltaVersion = "1.1.0"
     icebergVersion = "0.14.1"
     jacksonVersion = "2.15.3"
     junit5Version = "5.11.4"
     mockitoVersion = "4.11.0"
-    postgresqlVersion = "42.7.4"
-    micrometerVersion = '1.14.2'
+    postgresqlVersion = "42.7.5"
+    micrometerVersion = '1.14.4'
 
     sparkVersion = project.findProperty("spark2.spark.version")
     scalaBinaryVersion = "2.11"
 }
 
 dependencies {
+    compileOnly(project(path: ":shared"))
     compileOnly(project(path: ":shared", configuration: "scala212RuntimeElements"))
 
     compileOnly("org.apache.spark:spark-sql_${scalaBinaryVersion}:${sparkVersion}")
@@ -47,6 +48,7 @@ dependencies {
 
     // TODO: Replace 'testFixturesApi' with 'testImplementation'
     // TODO: Remove the test dependency on 'shared'
+    testCompileOnly(project(path: ":shared"))
     testFixturesApi(project(path: ":shared", configuration: "scala212RuntimeElements"))
     testFixturesApi("com.fasterxml.jackson.module:jackson-module-scala_${scalaBinaryVersion}:${jacksonVersion}")
     testFixturesApi("org.apache.spark:spark-hive_${scalaBinaryVersion}:${sparkVersion}")

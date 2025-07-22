@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -10,49 +11,51 @@ from typing import TYPE_CHECKING, Any, TypeVar, Union, cast
 
 import attr
 import yaml
+from openlineage.client import event_v2
+from openlineage.client.facets import FacetsConfig
 from openlineage.client.filter import Filter, FilterConfig, create_filter
+from openlineage.client.generated.environment_variables_run import (
+    EnvironmentVariable,
+    EnvironmentVariablesRunFacet,
+)
+from openlineage.client.generated.tags_job import TagsJobFacet, TagsJobFacetFields
+from openlineage.client.generated.tags_run import TagsRunFacet, TagsRunFacetFields
+from openlineage.client.run import DatasetEvent, JobEvent, RunEvent
 from openlineage.client.serde import Serde
+from openlineage.client.tags import TagsConfig
+from openlineage.client.transport import (
+    Transport,
+    TransportFactory,
+    get_default_factory,
+)
+from openlineage.client.transport.http import HttpConfig, HttpTransport
+from openlineage.client.transport.noop import NoopConfig, NoopTransport
 from openlineage.client.utils import deep_merge_dicts
 
 if TYPE_CHECKING:
     from requests import Session
     from requests.adapters import HTTPAdapter
 
-import contextlib
-
-from openlineage.client import event_v2
-from openlineage.client.facets import FacetsConfig
-from openlineage.client.generated.environment_variables_run import (
-    EnvironmentVariable,
-    EnvironmentVariablesRunFacet,
-)
-from openlineage.client.run import DatasetEvent, JobEvent, RunEvent
-from openlineage.client.transport import (
-    Transport,
-    TransportFactory,
-    get_default_factory,
-)
-from openlineage.client.transport.http import HttpConfig, HttpTransport, create_token_provider
-from openlineage.client.transport.noop import NoopConfig, NoopTransport
 
 Event_v1 = Union[RunEvent, DatasetEvent, JobEvent]
 Event_v2 = Union[event_v2.RunEvent, event_v2.DatasetEvent, event_v2.JobEvent]
 Event = Union[Event_v1, Event_v2]
 
 
-@attr.s
+@attr.define
 class OpenLineageClientOptions:
-    timeout: float = attr.ib(default=5.0)
-    verify: bool = attr.ib(default=True)
-    api_key: str = attr.ib(default=None)
-    adapter: HTTPAdapter = attr.ib(default=None)
+    timeout: float = 5.0
+    verify: bool = True
+    api_key: str | None = None
+    adapter: HTTPAdapter | None = None
 
 
-@attr.s
+@attr.define
 class OpenLineageConfig:
-    transport: dict[str, Any] | None = attr.ib(factory=dict)
-    facets: FacetsConfig = attr.ib(factory=FacetsConfig)
-    filters: list[FilterConfig] = attr.ib(factory=list)
+    transport: dict[str, Any] | None = attr.field(factory=dict)
+    facets: FacetsConfig = attr.field(factory=FacetsConfig)
+    filters: list[FilterConfig] = attr.field(factory=list)
+    tags: TagsConfig = attr.field(factory=TagsConfig)
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> OpenLineageConfig:
@@ -63,6 +66,13 @@ class OpenLineageConfig:
             config.facets = FacetsConfig(**params["facets"])
         if "filters" in params:
             config.filters = [FilterConfig(**filter_config) for filter_config in params["filters"]]
+        if "tags" in params:
+            job_tags = params["tags"].get("job", {})
+            run_tags = params["tags"].get("run", {})
+            config.tags = TagsConfig(
+                job=[TagsJobFacetFields(key, value, "USER") for (key, value) in job_tags.items()],
+                run=[TagsRunFacetFields(key, value, "USER") for (key, value) in run_tags.items()],
+            )
         return config
 
 
@@ -142,7 +152,7 @@ class OpenLineageClient:
     ) -> Event | None:
         """Filters jobs according to config-defined events"""
         for _filter in self._filters:
-            if isinstance(event, RunEvent) and _filter.filter_event(event) is None:
+            if isinstance(event, (RunEvent, event_v2.RunEvent)) and _filter.filter_event(event) is None:
                 return None
         return event
 
@@ -152,6 +162,11 @@ class OpenLineageClient:
         if type(event) not in get_args(Event):
             msg = "`emit` only accepts RunEvent, DatasetEvent, JobEvent classes"
             raise ValueError(msg)
+
+        if log.isEnabledFor(logging.DEBUG):
+            val = Serde.to_json(event).encode("utf-8")
+            log.debug("OpenLineageClient will *try* to emit event %s", val)
+
         if not self.transport:
             log.error("Tried to emit OpenLineage event, but transport is not configured.")
             return
@@ -163,12 +178,19 @@ class OpenLineageClient:
             return
 
         event = self.add_environment_facets(event)
+        event = self.update_event_tags_facets(event)
 
-        if log.isEnabledFor(logging.DEBUG):
-            val = Serde.to_json(event).encode("utf-8")
-            log.debug("OpenLineageClient will emit event %s", val)
         self.transport.emit(event)
         log.debug("OpenLineage event successfully emitted.")
+
+    def close(self, timeout: float = -1.0) -> bool:
+        """
+        Closes down the transport until all events are processed or timeout is reached.
+        Params:
+          timeout: Timeout in seconds. `-1` means to block until last event is processed, 0 means no timeout.
+
+        """
+        return self.transport.close(timeout)
 
     @property
     def config(self) -> OpenLineageConfig:
@@ -225,7 +247,7 @@ class OpenLineageClient:
 
         # 2. Check if transport is provided explicitly
         if kwargs.get("transport"):
-            return cast(Transport, kwargs["transport"])
+            return cast("Transport", kwargs["transport"])
 
         # 3. Check if transport configuration is provided in YAML config file
         if self.config.transport and self.config.transport.get("type"):
@@ -279,28 +301,26 @@ class OpenLineageClient:
                     return path
                 if path and verbose:
                     log.debug("OpenLineage config file is missing or not readable: `%s`.", path)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # We can get different errors depending on system
                 if verbose:
                     log.exception("Couldn't check if OpenLineage config file is readable: `%s`", path)
         return None
 
-    @staticmethod
-    def _http_transport_from_env_variables() -> HttpTransport:
-        config = HttpConfig(
-            url=os.environ["OPENLINEAGE_URL"],
-            auth=create_token_provider(
-                {
-                    "type": "api_key",
-                    "apiKey": os.environ.get("OPENLINEAGE_API_KEY", ""),
-                },
-            ),
-        )
-        endpoint = os.environ.get("OPENLINEAGE_ENDPOINT", None)
-        if endpoint is not None:
-            config.endpoint = endpoint
-
-        return HttpTransport(config)
+    def _http_transport_from_env_variables(self) -> HttpTransport:
+        """
+        Create HTTP transport from legacy environment variables
+        """
+        # Start with basic config from legacy environment variables
+        config_dict = {
+            "url": os.environ["OPENLINEAGE_URL"],
+            "auth": {
+                "type": "api_key",
+                "apiKey": os.environ.get("OPENLINEAGE_API_KEY", ""),
+            },
+            "endpoint": os.environ.get("OPENLINEAGE_ENDPOINT", "api/v1/lineage"),
+        }
+        return HttpTransport(HttpConfig.from_dict(config_dict))
 
     @staticmethod
     def _http_transport_from_url(
@@ -330,9 +350,13 @@ class OpenLineageClient:
                     default_transport_name,
                 )
                 return
+
+            api_key = os.environ.get("OPENLINEAGE_API_KEY")
+            endpoint = os.environ.get("OPENLINEAGE_ENDPOINT")
+
             os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__TYPE"] = "http"
             os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__URL"] = url
-            if api_key := os.environ.get("OPENLINEAGE_API_KEY"):
+            if api_key:
                 os.environ[
                     f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__AUTH"
                 ] = json.dumps(
@@ -341,10 +365,24 @@ class OpenLineageClient:
                         "apiKey": api_key,
                     }
                 )
-            if endpoint := os.environ.get("OPENLINEAGE_ENDPOINT"):
+            if endpoint:
                 os.environ[
                     f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__ENDPOINT"
                 ] = endpoint
+
+            if os.environ.get("OPENLINEAGE__TRANSPORT__TYPE") == "async_http":
+                # Special case - for seamless switch to async transport
+                if not os.getenv("OPENLINEAGE__TRANSPORT__URL"):
+                    os.environ["OPENLINEAGE__TRANSPORT__URL"] = url
+                if api_key and not os.getenv("OPENLINEAGE__TRANSPORT__AUTH"):
+                    os.environ["OPENLINEAGE__TRANSPORT__AUTH"] = json.dumps(
+                        {
+                            "type": "api_key",
+                            "apiKey": api_key,
+                        }
+                    )
+                if endpoint and not os.getenv("OPENLINEAGE__TRANSPORT__ENDPOINT"):
+                    os.environ["OPENLINEAGE__TRANSPORT__ENDPOINT"] = endpoint
 
     @classmethod
     def _load_config_from_env_variables(cls) -> dict[str, Any] | None:
@@ -362,7 +400,6 @@ class OpenLineageClient:
             # Parse value (try to parse as JSON, otherwise lowercase the value)
             with contextlib.suppress(json.JSONDecodeError):
                 env_value = json.loads(env_value)  # noqa: PLW2901
-
             cls._insert_into_config(config, keys, env_value)
 
         return config
@@ -384,7 +421,10 @@ class OpenLineageClient:
         """
         Adds environment variables as facets to the event object.
         """
-        if isinstance(event, RunEvent) and (env_vars := self._collect_environment_variables()):
+        if isinstance(event, (RunEvent, event_v2.RunEvent)) and (
+            env_vars := self._collect_environment_variables()
+        ):
+            event.run.facets = event.run.facets or {}
             event.run.facets["environmentVariables"] = EnvironmentVariablesRunFacet(
                 environmentVariables=[
                     EnvironmentVariable(name=name, value=value) for name, value in env_vars.items()
@@ -404,3 +444,56 @@ class OpenLineageClient:
                 missing_vars,
             )
         return filtered_vars
+
+    def update_event_tags_facets(self, event: Event) -> Event:
+        """
+        Creates or updates job and run tag facets based on user-supplied environment variables
+        """
+        run_event_types = (RunEvent, event_v2.RunEvent)
+        run_and_job_event_types = (RunEvent, event_v2.RunEvent, JobEvent, event_v2.JobEvent)
+        tags_job = self.config.tags.job
+        if isinstance(event, run_and_job_event_types) and tags_job:
+            # Ensure facets exists
+            event.job.facets = {} if not event.job.facets else event.job.facets
+            tags_facet = event.job.facets.get("tags", TagsJobFacet())
+            event.job.facets["tags"] = self._update_tag_facet(tags_facet, tags_job)  # type: ignore [arg-type, assignment]
+
+        tags_run = self.config.tags.run
+        if isinstance(event, run_event_types) and tags_run:
+            # Ensure facets exists
+            event.run.facets = {} if not event.run.facets else event.run.facets
+            tags_facet = event.run.facets.get("tags", TagsRunFacet())
+            event.run.facets["tags"] = self._update_tag_facet(tags_facet, tags_run)  # type: ignore [arg-type, assignment]
+
+        return event
+
+    def _update_tag_facet(
+        self,
+        tags_facet: TagsJobFacet | TagsRunFacet,
+        user_tags: list[TagsJobFacetFields | TagsRunFacetFields],
+    ) -> TagsJobFacet | TagsRunFacet:
+        """
+        Handles updating tags in an existing tag facet
+        """
+
+        # Get tags from the facet that will not be updated (Do not have the same key as a user tag)
+        user_tag_keys = [tag.key for tag in user_tags]
+        keep_tags = []
+        if tags_facet.tags is not None:
+            keep_tags = [tag for tag in tags_facet.tags if tag.key.lower() not in user_tag_keys]
+
+        # Update tag key for any user tags that should override a facet tag.
+        # This preserves case of the facet tag key while updating value and source.
+        facet_tag_keys = {}
+        if tags_facet.tags is not None:
+            facet_tag_keys = {tag.key.lower(): tag.key for tag in tags_facet.tags}
+
+        for user_tag in user_tags:
+            if user_tag.key in facet_tag_keys:
+                facet_tag_key = facet_tag_keys[user_tag.key]
+                log.info("Overriding integration-supplied tag `%s` with user-supplied tag", facet_tag_key)
+                user_tag.key = facet_tag_key
+
+        all_tags = keep_tags + user_tags
+        tags_facet.tags = all_tags  # type: ignore [assignment]
+        return tags_facet

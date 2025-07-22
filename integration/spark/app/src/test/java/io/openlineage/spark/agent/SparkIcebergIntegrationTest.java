@@ -26,6 +26,7 @@ import io.openlineage.client.OpenLineageClientUtils;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -484,8 +485,10 @@ class SparkIcebergIntegrationTest {
             .findFirst();
 
     assertThat(inputStatistics1).isPresent();
-    assertThat(inputStatistics1.get().getRowCount()).isGreaterThan(100);
-    assertThat(inputStatistics1.get().getSize()).isGreaterThan(0);
+    assertThat(inputStatistics1.get().getRowCount()).isEqualTo(100);
+    // size in bytes shall be greater than row count
+    assertThat(inputStatistics1.get().getSize())
+        .isGreaterThan(inputStatistics1.get().getRowCount());
     assertThat(inputStatistics1.get().getFileCount()).isEqualTo(1); // repartitioned
 
     // verify input2 statistics facet
@@ -500,8 +503,10 @@ class SparkIcebergIntegrationTest {
             .findFirst();
 
     assertThat(inputStatistics2).isPresent();
-    assertThat(inputStatistics2.get().getRowCount()).isGreaterThan(50);
-    assertThat(inputStatistics2.get().getSize()).isGreaterThan(0);
+    assertThat(inputStatistics2.get().getRowCount()).isEqualTo(50);
+    // size in bytes shall be greater than row count
+    assertThat(inputStatistics1.get().getSize())
+        .isGreaterThan(inputStatistics1.get().getRowCount());
     assertThat(inputStatistics2.get().getFileCount()).isEqualTo(1);
 
     // verify input1 statistics facet contains ScanReport facet
@@ -546,11 +551,11 @@ class SparkIcebergIntegrationTest {
       return;
     }
 
-    clearTables("temp", "scan_source1", "scan_target");
+    clearTables("temp", "scan_report_source", "scan_target");
     createTempDataset(3).createOrReplaceTempView("temp");
 
-    spark.sql("CREATE TABLE scan_source1 USING iceberg AS SELECT * FROM temp");
-    spark.sql("CREATE TABLE scan_target USING iceberg AS SELECT * FROM scan_source1");
+    spark.sql("CREATE TABLE scan_report_source USING iceberg AS SELECT * FROM temp");
+    spark.sql("CREATE TABLE scan_target USING iceberg AS SELECT * FROM scan_report_source");
 
     // make sure all event wer generated
     List<RunEvent> runEvents = getEventsEmittedWithJobName(mockServer, "scan_target");
@@ -558,7 +563,7 @@ class SparkIcebergIntegrationTest {
     List<InputDatasetInputFacets> inputFacets =
         runEvents.stream()
             .flatMap(e -> e.getInputs().stream())
-            .filter(e -> e.getName().endsWith("scan_source1"))
+            .filter(e -> e.getName().endsWith("scan_report_source"))
             .map(InputDataset::getInputFacets)
             .filter(Objects::nonNull)
             .collect(Collectors.toList());
@@ -601,6 +606,65 @@ class SparkIcebergIntegrationTest {
         .extracting("metadata")
         .asInstanceOf(InstanceOfAssertFactories.MAP)
         .containsEntry("engine-name", "spark");
+  }
+
+  @Test
+  @SuppressWarnings("PMD.JUnitTestsShouldIncludeAssert")
+  void testMultipleScanReportsForSameDataset() {
+    if (JAVA_VERSION.startsWith("1.8") && System.getProperty(SPARK_VERSION).startsWith("3.5")) {
+      // This test will not work as Iceberg classes used are Java 11
+      assertThat(true).isTrue();
+      return;
+    }
+
+    clearTables("temp", "scan_source1", "scan_target1", "scan_target2");
+    createTempDataset(10).createOrReplaceTempView("temp");
+
+    spark.sql("CREATE TABLE scan_source1 USING iceberg AS SELECT * FROM temp");
+
+    // same dataset with same snapshot id will be read, but different columns will be projected
+    spark.sql("CREATE TABLE scan_target1 USING iceberg AS SELECT a FROM scan_source1");
+    spark.sql("CREATE TABLE scan_target2 USING iceberg AS SELECT b FROM scan_source1");
+
+    List<InputDatasetInputFacets> inputFacets1 =
+        getEventsEmittedWithJobName(mockServer, "scan_target1").stream()
+            .flatMap(e -> e.getInputs().stream())
+            .filter(e -> e.getName().endsWith("scan_source1"))
+            .map(InputDataset::getInputFacets)
+            .collect(Collectors.toList());
+
+    // get scan report facet
+    AbstractObjectAssert<?, ?> icebergScanReport1 =
+        assertThat(inputFacets1.stream())
+            .map(l -> l.getAdditionalProperties())
+            .filteredOn(e -> e.containsKey("icebergScanReport"))
+            .map(e -> e.get("icebergScanReport"))
+            .map(e -> e.getAdditionalProperties())
+            .singleElement();
+
+    icebergScanReport1
+        .extracting("projectedFieldNames")
+        .isEqualTo(new ArrayList<>(Collections.singletonList("a")));
+
+    List<InputDatasetInputFacets> inputFacets2 =
+        getEventsEmittedWithJobName(mockServer, "scan_target2").stream()
+            .flatMap(e -> e.getInputs().stream())
+            .filter(e -> e.getName().endsWith("scan_source1"))
+            .map(InputDataset::getInputFacets)
+            .collect(Collectors.toList());
+
+    // get scan report facet
+    AbstractObjectAssert<?, ?> icebergScanReport2 =
+        assertThat(inputFacets2.stream())
+            .map(l -> l.getAdditionalProperties())
+            .filteredOn(e -> e.containsKey("icebergScanReport"))
+            .map(e -> e.get("icebergScanReport"))
+            .map(e -> e.getAdditionalProperties())
+            .singleElement();
+
+    icebergScanReport2
+        .extracting("projectedFieldNames")
+        .isEqualTo(new ArrayList<>(Collections.singletonList("b")));
   }
 
   @Test

@@ -19,6 +19,7 @@ import io.openlineage.spark.agent.util.ScalaConversionUtils;
 import io.openlineage.spark3.agent.lifecycle.plan.column.visitors.ExpressionDependencyVisitor;
 import io.openlineage.spark3.agent.lifecycle.plan.column.visitors.IcebergMergeIntoDependencyVisitor;
 import io.openlineage.spark3.agent.lifecycle.plan.column.visitors.UnionDependencyVisitor;
+import io.openlineage.spark3.agent.utils.ExtensionDataSourceV2Utils;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedList;
@@ -60,8 +61,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.Sort;
 import org.apache.spark.sql.catalyst.plans.logical.Union;
 import org.apache.spark.sql.catalyst.plans.logical.Window;
-import org.apache.spark.sql.execution.datasources.LogicalRelation;
-import org.apache.spark.sql.execution.datasources.jdbc.JDBCRelation;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
 import scala.Option;
 import scala.Tuple2;
 import scala.collection.Seq;
@@ -151,10 +151,9 @@ public class ExpressionDependencyCollector {
     } else if (node instanceof Window) {
       expressions.addAll(
           ScalaConversionUtils.<NamedExpression>fromSeq(((Window) node).windowExpressions()));
-    } else if (node instanceof LogicalRelation) {
-      if (((LogicalRelation) node).relation() instanceof JDBCRelation) {
-        JdbcColumnLineageCollector.extractExpressionsFromJDBC(context, node);
-      }
+    } else if (node instanceof DataSourceV2Relation
+        && ExtensionDataSourceV2Utils.hasQueryExtensionLineage((DataSourceV2Relation) node)) {
+      QueryRelationColumnLineageCollector.extractExpressionsFromQuery(context, node);
     }
     expressions.stream()
         .forEach(

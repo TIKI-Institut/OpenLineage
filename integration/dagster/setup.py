@@ -10,7 +10,7 @@ from setuptools import find_namespace_packages, setup
 with open("README.md") as readme_file:
     readme = readme_file.read()
 
-__version__ = "1.27.0"
+__version__ = "1.36.0"
 
 DAGSTER_VERSION = "1.0.0"
 
@@ -47,7 +47,7 @@ setup(
     include_package_data=True,
     install_requires=requirements,
     extras_require=extras_require,
-    python_requires=">=3.8",
+    python_requires=">=3.9",
     zip_safe=False,
     keywords="openlineage",
 )
