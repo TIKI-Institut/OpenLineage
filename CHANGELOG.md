@@ -2,6 +2,16 @@
 
 ## [Unreleased](https://github.com/OpenLineage/OpenLineage/compare/1.37.0...HEAD)
 
+### Added
+
+### Changed
+
+### Fixed
+
+* **Spark: fix lineage for SQLs run within structured streaming queries.** [`#3405`](https://github.com/OpenLineage/OpenLineage/pull/3405) [@pawel-big-lebowski](https://github.com/pawel-big-lebowski)
+  *When a streaming query gets executed, treat SQL executed within a streaming query as parts of a streaming job.*
+
+
 ## [1.37.0](https://github.com/OpenLineage/OpenLineage/compare/1.36.0...1.37.0) - 2025-08-11
 
 ### Added
