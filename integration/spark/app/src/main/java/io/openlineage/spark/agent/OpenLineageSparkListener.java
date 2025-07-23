@@ -28,6 +28,8 @@ import io.openlineage.spark.agent.util.SparkVersionUtils;
 import io.openlineage.spark.api.OpenLineageContext;
 import io.openlineage.spark.api.SparkOpenLineageConfig;
 import java.net.URISyntaxException;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -207,6 +209,7 @@ public class OpenLineageSparkListener extends org.apache.spark.scheduler.SparkLi
                                       contextFactory.openLineageEventEmitter.getJobNamespace())
                                   .name(context.getJobName())
                                   .build())
+                          .eventTime(ZonedDateTime.now(ZoneOffset.UTC))
                           .eventType(
                               event.exception().isEmpty() ? EventType.COMPLETE : EventType.FAIL)
                           .build()));
