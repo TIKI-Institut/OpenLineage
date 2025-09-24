@@ -9,27 +9,36 @@ import org.apache.spark.package$;
 
 class VisitorFactoryProvider {
 
-  private static final String SPARK3_FACTORY_NAME =
-      "io.openlineage.spark.agent.lifecycle.Spark3VisitorFactoryImpl";
+    private static final String SPARK3_FACTORY_NAME =
+            "io.openlineage.spark.agent.lifecycle.Spark3VisitorFactoryImpl";
 
-  private static final String SPARK32_FACTORY_NAME =
-      "io.openlineage.spark.agent.lifecycle.Spark32VisitorFactoryImpl";
+    private static final String SPARK32_FACTORY_NAME =
+            "io.openlineage.spark.agent.lifecycle.Spark32VisitorFactoryImpl";
 
-  static VisitorFactory getInstance() {
-    String version = package$.MODULE$.SPARK_VERSION();
-    try {
-      return (VisitorFactory) Class.forName(getVisitorFactoryForVersion(version)).newInstance();
-    } catch (Exception e) {
-      throw new RuntimeException(
-          String.format("Can't instantiate visitor factory for version: %s", version), e);
+    private static final String SPARK33_FACTORY_NAME =
+            "io.openlineage.spark.agent.lifecycle.Spark33VisitorFactoryImpl";
+
+    static VisitorFactory getInstance() {
+        String version = package$.MODULE$.SPARK_VERSION();
+        try {
+            return (VisitorFactory) Class.forName(getVisitorFactoryForVersion(version)).newInstance();
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    String.format("Can't instantiate visitor factory for version: %s", version), e);
+        }
     }
-  }
 
-  static String getVisitorFactoryForVersion(String version) {
-    if (version.startsWith("3.2")) {
-      return SPARK32_FACTORY_NAME;
-    } else {
-      return SPARK3_FACTORY_NAME;
+    static String getVisitorFactoryForVersion(String version) {
+        if (version.startsWith("3.2")) {
+            return SPARK32_FACTORY_NAME;
+        } else if (version.startsWith("3.3")) {
+            return SPARK33_FACTORY_NAME;
+        } else if (version.startsWith("3.4")) {
+            return SPARK33_FACTORY_NAME;
+        } else if (version.startsWith("3.5")) {
+            return SPARK33_FACTORY_NAME;
+        } else {
+            return SPARK3_FACTORY_NAME;
+        }
     }
-  }
 }
