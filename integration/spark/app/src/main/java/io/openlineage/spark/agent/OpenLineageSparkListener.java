@@ -142,8 +142,6 @@ public class OpenLineageSparkListener extends org.apache.spark.scheduler.SparkLi
     } else if (event instanceof QueryTerminatedEvent) {
       log.debug("onOtherEvent called with event type QueryTerminatedEvent: [{}].", event);
       streamingQueryTerminated((QueryTerminatedEvent) event);
-    } else {
-      log.warn("onOtherEvent called with unsupported event: {}", event.getClass());
     }
   }
 
